@@ -31,7 +31,8 @@ creds_dict = json.loads(GOOGLE_CREDS_JSON)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 
-# Local file to store processed order IDs (to be persisted on Render disk)
+# Local file to store processed order IDs
+# (On Render, consider using a persistent disk and changing this path to /data/processed_orders.txt)
 processed_orders_file = "processed_orders.txt"
 
 ##############################################################################
@@ -97,7 +98,7 @@ def extract_perfume_number(value: str):
 #                         Google Sheets Interactions                         #
 ##############################################################################
 
-# Open the Google Sheets (you must have a sheet named "OBC lager" with these sheets)
+# Open the Google Sheets (you must have a sheet named "OBC lager" with these worksheets)
 sheet = client.open("OBC lager").sheet1              # Main sheet with inventory
 sales_sheet = client.open("OBC lager").worksheet("Blad2")  # "Blad2" for daily sales
 
@@ -131,6 +132,7 @@ def get_inventory_and_sold():
             if isinstance(antal_value, int):
                 inventory[nummer_float] = antal_value
             else:
+                # handle potential special characters like '−'
                 inventory[nummer_float] = int(antal_value.replace('−', '-').strip())
 
             # Convert sold to int
@@ -265,6 +267,7 @@ def fetch_new_orders(start_date):
             orders.extend(fetched_orders)
             print(f"Fetched {len(fetched_orders)} orders.")
 
+            # Handle pagination if there's a "next" link
             link_header = response.headers.get('Link')
             if link_header:
                 next_link = None
@@ -327,6 +330,7 @@ def process_orders(orders, inventory, sold, processed_orders):
                     else:
                         print(f"Perfume number '{prop['value']}' not found in inventory.")
 
+                # Optional: check how many perfumes are expected in the bundle
                 expected_count = 3 if "3x" in title else 2
                 if len(perfumes_processed) != expected_count:
                     print(f"Warning: Expected {expected_count} in bundle, found {len(perfumes_processed)}.")
@@ -402,8 +406,8 @@ def process_orders(orders, inventory, sold, processed_orders):
 def main():
     try:
         print("Starting main process...")
-        # Example: Only process orders from January 3, 2025 onward
-        start_date = datetime(2025, 1, 3, 0, 0)
+        # Only process orders from 7 January 2025 at 13:02 onwards
+        start_date = datetime(2025, 1, 7, 13, 2)
 
         processed_orders = load_processed_orders()
         inventory, sold_data = get_inventory_and_sold()
