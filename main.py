@@ -5,6 +5,7 @@ import time
 import json
 import requests
 import gspread
+import psycopg2
 
 from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
@@ -31,27 +32,71 @@ creds_dict = json.loads(GOOGLE_CREDS_JSON)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 
-# Local file to store processed order IDs
-# (On Render, consider using a persistent disk and changing this path to /data/processed_orders.txt)
-processed_orders_file = "processed_orders.txt"
+# PostgreSQL connection
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("Missing environment variable: DATABASE_URL")
+
+##############################################################################
+#                           PostgreSQL Utilities                             #
+##############################################################################
+
+def create_table_if_not_exists():
+    """
+    Create a 'processed_orders' table if it does not exist.
+    Columns:
+      - order_id (TEXT, primary key)
+      - processed_at (TIMESTAMP, defaults to NOW())
+    """
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS processed_orders (
+            order_id TEXT PRIMARY KEY,
+            processed_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+    """)
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def load_processed_orders_from_db():
+    """
+    Fetch all order IDs from the 'processed_orders' table and return them as a set.
+    """
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute("SELECT order_id FROM processed_orders;")
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return set(row[0] for row in rows)
+
+def save_processed_orders_to_db(order_ids):
+    """
+    Insert new order IDs into 'processed_orders' table.
+    Uses ON CONFLICT DO NOTHING to avoid duplicates if an ID already exists.
+    """
+    if not order_ids:
+        return  # No new orders to save
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+
+    insert_query = """
+        INSERT INTO processed_orders (order_id)
+        VALUES (%s)
+        ON CONFLICT (order_id) DO NOTHING;
+    """
+    for order_id in order_ids:
+        cursor.execute(insert_query, (order_id,))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 ##############################################################################
 #                                 Utilities                                  #
 ##############################################################################
-
-def load_processed_orders():
-    """Load processed order IDs from a local file."""
-    if os.path.exists(processed_orders_file):
-        with open(processed_orders_file, "r") as file:
-            return set(line.strip() for line in file if not line.startswith("Processed at"))
-    return set()
-
-def save_processed_orders(order_ids):
-    """Append newly processed order IDs to file with a timestamp."""
-    with open(processed_orders_file, "a") as file:
-        file.write(f"Processed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        for order_id in order_ids:
-            file.write(f"{order_id}\n")
 
 def safe_api_call(func, *args, **kwargs):
     """
@@ -64,8 +109,9 @@ def safe_api_call(func, *args, **kwargs):
         time.sleep(2)
         return result
     except gspread.exceptions.APIError as e:
+        # If Google Sheets API rate limit
         if e.response.status_code == 429:
-            print("API rate limit exceeded, waiting 60 seconds...")
+            print("Google Sheets API rate limit exceeded, waiting 60 seconds...")
             time.sleep(60)
             return safe_api_call(func, *args, **kwargs)
         else:
@@ -75,7 +121,7 @@ def format_perfume_number_for_sheet(num_float: float) -> str:
     """
     Convert a float perfume number (e.g. 149.0) into a sheet-friendly string.
     - If integer float (149.0), convert to '149'
-    - Otherwise keep as, e.g., '149.5'
+    - Otherwise keep e.g. '149.5'
     """
     if num_float.is_integer():
         return str(int(num_float))
@@ -98,7 +144,7 @@ def extract_perfume_number(value: str):
 #                         Google Sheets Interactions                         #
 ##############################################################################
 
-# Open the Google Sheets (you must have a sheet named "OBC lager" with these worksheets)
+# Open the Google Sheets (must have a sheet named "OBC lager" with these worksheets)
 sheet = client.open("OBC lager").sheet1              # Main sheet with inventory
 sales_sheet = client.open("OBC lager").worksheet("Blad2")  # "Blad2" for daily sales
 
@@ -110,7 +156,6 @@ def get_inventory_and_sold():
       - sold[perfume_number_float]      = int
     """
     print("Fetching inventory and sold amounts from Google Sheets...")
-    # Using get_all_records to get all rows as a list of dicts:
     expected_headers = ['nummer:', 'Antal:', 'Sold:']
     records = safe_api_call(sheet.get_all_records, expected_headers=expected_headers)
 
@@ -132,7 +177,6 @@ def get_inventory_and_sold():
             if isinstance(antal_value, int):
                 inventory[nummer_float] = antal_value
             else:
-                # handle potential special characters like '−'
                 inventory[nummer_float] = int(antal_value.replace('−', '-').strip())
 
             # Convert sold to int
@@ -160,7 +204,6 @@ def ensure_columns_for_fragrance(fragrance_number_float):
     if fragrance_header_str in current_headers:
         return  # Already present
 
-    # Otherwise, add a new column at the end
     safe_api_call(sales_sheet.add_cols, 1)
     new_col_index = len(current_headers) + 1
     safe_api_call(sales_sheet.update_cell, 1, new_col_index, fragrance_header_str)
@@ -176,7 +219,6 @@ def find_or_create_row_for_date(date_str, sales_data):
     if date_str in all_dates:
         return all_dates.index(date_str) + 1
 
-    # Insert it
     all_dates_sorted = sorted(all_dates[1:] + [date_str])
     insert_pos = all_dates_sorted.index(date_str) + 2
     safe_api_call(sales_sheet.insert_row, [date_str], insert_pos)
@@ -267,7 +309,6 @@ def fetch_new_orders(start_date):
             orders.extend(fetched_orders)
             print(f"Fetched {len(fetched_orders)} orders.")
 
-            # Handle pagination if there's a "next" link
             link_header = response.headers.get('Link')
             if link_header:
                 next_link = None
@@ -289,20 +330,22 @@ def fetch_new_orders(start_date):
     print(f"Total orders fetched: {len(orders)}")
     return orders
 
-def process_orders(orders, inventory, sold, processed_orders):
+def process_orders(orders, inventory, sold, already_processed_orders):
     """
-    Process each order to update inventory & sold, and build a sales log.
-    Then do batch updates to the main sheet & 'Blad2'.
+    Process each order to update inventory & sold, build a sales log,
+    and return a list of newly processed order IDs.
     """
     print("Processing orders...")
     new_processed_order_ids = []
     sales_log = {}
 
     for order in orders:
-        if str(order['id']) in processed_orders:
+        order_id_str = str(order['id'])
+        # Skip if already processed
+        if order_id_str in already_processed_orders:
             continue
 
-        print(f"\nProcessing Order ID: {order['id']}")
+        print(f"\nProcessing Order ID: {order_id_str}")
         order_date_str = datetime.strptime(
             order['created_at'], "%Y-%m-%dT%H:%M:%S%z"
         ).date().strftime("%Y-%m-%d")
@@ -330,7 +373,6 @@ def process_orders(orders, inventory, sold, processed_orders):
                     else:
                         print(f"Perfume number '{prop['value']}' not found in inventory.")
 
-                # Optional: check how many perfumes are expected in the bundle
                 expected_count = 3 if "3x" in title else 2
                 if len(perfumes_processed) != expected_count:
                     print(f"Warning: Expected {expected_count} in bundle, found {len(perfumes_processed)}.")
@@ -345,11 +387,10 @@ def process_orders(orders, inventory, sold, processed_orders):
                 else:
                     print(f"Perfume number for '{title}' not found in inventory.")
 
-        new_processed_order_ids.append(str(order['id']))
+        # If we get here, we've processed this order
+        new_processed_order_ids.append(order_id_str)
 
-    if new_processed_order_ids:
-        save_processed_orders(new_processed_order_ids)
-
+    # Batch update the main sheet (inventory/sold)
     print("Preparing to batch update inventory and sold in the main sheet...")
     sheet_values = safe_api_call(sheet.get_all_values)
 
@@ -392,12 +433,14 @@ def process_orders(orders, inventory, sold, processed_orders):
         print(f"Batch updating {len(sold_updates)} sold cells...")
         safe_api_call(sheet.update_cells, sold_updates)
 
+    # Now update Blad2 (daily sales)
     if sales_log:
         update_sales_data(sales_log)
     else:
         print("No sales data to log in Blad2.")
 
     print("Order processing completed.")
+    return new_processed_order_ids
 
 ##############################################################################
 #                                   MAIN                                     #
@@ -406,15 +449,28 @@ def process_orders(orders, inventory, sold, processed_orders):
 def main():
     try:
         print("Starting main process...")
-        # Only process orders from 7 January 2025 at 13:02 onwards
+
+        # 1. Ensure our table exists
+        create_table_if_not_exists()
+
+        # 2. Only process orders from 7 January 2025 at 13:02 onward, for example
         start_date = datetime(2025, 1, 7, 13, 2)
 
-        processed_orders = load_processed_orders()
-        inventory, sold_data = get_inventory_and_sold()
-        orders = fetch_new_orders(start_date)
+        # 3. Load processed order IDs from the database
+        processed_orders = load_processed_orders_from_db()
 
+        # 4. Get inventory and sold data from the main sheet
+        inventory, sold_data = get_inventory_and_sold()
+
+        # 5. Fetch new Shopify orders from the given start date
+        orders = fetch_new_orders(start_date)
         if orders:
-            process_orders(orders, inventory, sold_data, processed_orders)
+            # 6. Process them
+            new_processed_ids = process_orders(orders, inventory, sold_data, processed_orders)
+
+            # 7. Save newly processed order IDs back to the DB
+            save_processed_orders_to_db(new_processed_ids)
+
             print("Inventory, sold amounts, and daily sales data updated.")
         else:
             print("No new orders found.")
@@ -423,7 +479,7 @@ def main():
         print(f"Error in main process: {e}")
         print("No changes saved.")
     finally:
-        print("Script ended:", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        print("Script ended:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 if __name__ == "__main__":
     print("Starting script...")
