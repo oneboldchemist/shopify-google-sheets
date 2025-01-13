@@ -14,10 +14,27 @@ from oauth2client.service_account import ServiceAccountCredentials
 #                           Environment Variables                            #
 ##############################################################################
 
-# Shopify credentials
-SHOP_DOMAIN = os.getenv("SHOP_DOMAIN") or "your-shop-domain.myshopify.com"
-SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN") or "your-access-token"
-BASE_URL = f"https://{SHOP_DOMAIN}/admin/api/2023-07"
+# === Butik 1 (ingen prefix) ===
+SHOP_DOMAIN_1 = os.getenv("SHOP_DOMAIN_1") or "first-shop.myshopify.com"
+SHOPIFY_ACCESS_TOKEN_1 = os.getenv("SHOPIFY_ACCESS_TOKEN_1") or "access-token-shop-1"
+
+# === Butik 2 (prefix) ===
+SHOP_DOMAIN_2 = os.getenv("SHOP_DOMAIN_2") or "second-shop.myshopify.com"
+SHOPIFY_ACCESS_TOKEN_2 = os.getenv("SHOPIFY_ACCESS_TOKEN_2") or "access-token-shop-2"
+
+# Bygg en lista med "konfigurationer" för respektive butik
+SHOPIFY_CONFIGS = [
+    {
+        "domain": SHOP_DOMAIN_1,
+        "access_token": SHOPIFY_ACCESS_TOKEN_1,
+        "use_prefix": False  # <- Butik 1 får INGEN prefix
+    },
+    {
+        "domain": SHOP_DOMAIN_2,
+        "access_token": SHOPIFY_ACCESS_TOKEN_2,
+        "use_prefix": True   # <- Butik 2 får prefix
+    }
+]
 
 # Google credentials (JSON) and scope
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
@@ -43,10 +60,8 @@ if not DATABASE_URL:
 
 def create_table_if_not_exists():
     """
-    Create a 'processed_orders' table if it does not exist.
-    Columns:
-      - order_id (TEXT, primary key)
-      - processed_at (TIMESTAMP, defaults to NOW())
+    Du behåller samma tabell som innan, så att redan sparade order-ID utan prefix
+    fortfarande är giltiga. Primärnyckeln är 'order_id' (TEXT).
     """
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
@@ -62,7 +77,8 @@ def create_table_if_not_exists():
 
 def load_processed_orders_from_db():
     """
-    Fetch all order IDs from the 'processed_orders' table and return them as a set.
+    Hämtar alla order_id från 'processed_orders' som en set.
+    (Dessa kan vara både "123456" och "second-shop.myshopify.com_123456".)
     """
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
@@ -74,11 +90,11 @@ def load_processed_orders_from_db():
 
 def save_processed_orders_to_db(order_ids):
     """
-    Insert new order IDs into 'processed_orders' table.
-    Uses ON CONFLICT DO NOTHING to avoid duplicates if an ID already exists.
+    order_ids är en lista med strängar (som ev. har prefix eller inte).
+    ON CONFLICT DO NOTHING undviker duplicering.
     """
     if not order_ids:
-        return  # No new orders to save
+        return
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
 
@@ -87,8 +103,8 @@ def save_processed_orders_to_db(order_ids):
         VALUES (%s)
         ON CONFLICT (order_id) DO NOTHING;
     """
-    for order_id in order_ids:
-        cursor.execute(insert_query, (order_id,))
+    for oid in order_ids:
+        cursor.execute(insert_query, (oid,))
 
     conn.commit()
     cursor.close()
@@ -99,17 +115,11 @@ def save_processed_orders_to_db(order_ids):
 ##############################################################################
 
 def safe_api_call(func, *args, **kwargs):
-    """
-    Wrapper for calls to the Google Sheets or Shopify API.
-    - Sleeps 2 seconds after each call (to avoid rate limits).
-    - If a 429 status code is encountered (rate limit), waits 60 seconds and retries.
-    """
     try:
         result = func(*args, **kwargs)
         time.sleep(2)
         return result
     except gspread.exceptions.APIError as e:
-        # If Google Sheets API rate limit
         if e.response.status_code == 429:
             print("Google Sheets API rate limit exceeded, waiting 60 seconds...")
             time.sleep(60)
@@ -118,20 +128,11 @@ def safe_api_call(func, *args, **kwargs):
             raise e
 
 def format_perfume_number_for_sheet(num_float: float) -> str:
-    """
-    Convert a float perfume number (e.g. 149.0) into a sheet-friendly string.
-    - If integer float (149.0), convert to '149'
-    - Otherwise keep e.g. '149.5'
-    """
     if num_float.is_integer():
         return str(int(num_float))
     return str(num_float)
 
 def extract_perfume_number(value: str):
-    """
-    Regex to capture up to 3 digits and optional decimal part (e.g. 22.0, 149, 149.0).
-    Returns a float or None if no match found.
-    """
     match = re.search(r"(\d{1,3}(?:\.\d+)?)\b", value)
     if match:
         try:
@@ -144,17 +145,10 @@ def extract_perfume_number(value: str):
 #                         Google Sheets Interactions                         #
 ##############################################################################
 
-# Open the Google Sheets (must have a sheet named "OBC lager" with these worksheets)
-sheet = client.open("OBC lager").sheet1              # Main sheet with inventory
-sales_sheet = client.open("OBC lager").worksheet("Blad2")  # "Blad2" for daily sales
+sheet = client.open("OBC lager").sheet1
+sales_sheet = client.open("OBC lager").worksheet("Blad2")
 
 def get_inventory_and_sold():
-    """
-    Fetch inventory (Antal) and sold amounts (Sold) from the main sheet.
-    Returns two dicts keyed by float perfume number:
-      - inventory[perfume_number_float] = int
-      - sold[perfume_number_float]      = int
-    """
     print("Fetching inventory and sold amounts from Google Sheets...")
     expected_headers = ['nummer:', 'Antal:', 'Sold:']
     records = safe_api_call(sheet.get_all_records, expected_headers=expected_headers)
@@ -173,13 +167,13 @@ def get_inventory_and_sold():
 
             nummer_float = float(nummer_value)
 
-            # Convert inventory to int
+            # Inventory
             if isinstance(antal_value, int):
                 inventory[nummer_float] = antal_value
             else:
                 inventory[nummer_float] = int(antal_value.replace('−', '-').strip())
 
-            # Convert sold to int
+            # Sold
             if sold_value == '' or sold_value is None:
                 sold_data[nummer_float] = 0
             else:
@@ -196,29 +190,19 @@ def get_inventory_and_sold():
     return inventory, sold_data
 
 def ensure_columns_for_fragrance(fragrance_number_float):
-    """
-    Ensure 'Blad2' has a column header for this fragrance.
-    """
     fragrance_header_str = format_perfume_number_for_sheet(fragrance_number_float)
     current_headers = safe_api_call(sales_sheet.row_values, 1)
     if fragrance_header_str in current_headers:
-        return  # Already present
-
+        return
     safe_api_call(sales_sheet.add_cols, 1)
     new_col_index = len(current_headers) + 1
     safe_api_call(sales_sheet.update_cell, 1, new_col_index, fragrance_header_str)
     print(f"Added column for fragrance '{fragrance_header_str}' at col {new_col_index}.")
 
 def find_or_create_row_for_date(date_str, sales_data):
-    """
-    Look for 'date_str' in the first column of 'Blad2'.
-    If not found, insert a new row in sorted position.
-    Return the 1-based row index in the sheet.
-    """
     all_dates = [row[0] for row in sales_data]
     if date_str in all_dates:
         return all_dates.index(date_str) + 1
-
     all_dates_sorted = sorted(all_dates[1:] + [date_str])
     insert_pos = all_dates_sorted.index(date_str) + 2
     safe_api_call(sales_sheet.insert_row, [date_str], insert_pos)
@@ -226,9 +210,6 @@ def find_or_create_row_for_date(date_str, sales_data):
     return insert_pos
 
 def update_sales_data(sales_log):
-    """
-    Update 'Blad2' (daily sales) in a batched manner.
-    """
     if not sales_log:
         print("No sales data to update in Blad2.")
         return
@@ -242,8 +223,6 @@ def update_sales_data(sales_log):
 
     for date_str, fragrance_dict in sorted_sales_log.items():
         row_index = find_or_create_row_for_date(date_str, sales_data)
-
-        # Ensure local list is big enough
         if row_index - 1 >= len(sales_data):
             needed_rows = (row_index - len(sales_data))
             for _ in range(needed_rows):
@@ -284,15 +263,11 @@ def update_sales_data(sales_log):
 #                           Shopify Order Handling                           #
 ##############################################################################
 
-def fetch_new_orders(start_date):
-    """
-    Fetch new orders from Shopify, created at or after `start_date`.
-    """
-    print(f"Fetching new orders from Shopify since {start_date}...")
-    orders = []
-    endpoint = f"{BASE_URL}/orders.json"
+def fetch_new_orders(shop_domain, shopify_access_token, start_date):
+    base_url = f"https://{shop_domain}/admin/api/2023-07"
+    endpoint = f"{base_url}/orders.json"
     headers = {
-        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
+        "X-Shopify-Access-Token": shopify_access_token,
         "Content-Type": "application/json"
     }
     params = {
@@ -301,13 +276,16 @@ def fetch_new_orders(start_date):
         "status": "any"
     }
 
+    print(f"Fetching new orders from {shop_domain} since {start_date}...")
+    orders = []
+
     while True:
         response = safe_api_call(requests.get, endpoint, headers=headers, params=params)
         if response.status_code == 200:
             data = response.json()
             fetched_orders = data["orders"]
             orders.extend(fetched_orders)
-            print(f"Fetched {len(fetched_orders)} orders.")
+            print(f"Fetched {len(fetched_orders)} orders from {shop_domain}.")
 
             link_header = response.headers.get('Link')
             if link_header:
@@ -324,28 +302,36 @@ def fetch_new_orders(start_date):
                     continue
             break
         else:
-            print(f"Failed to fetch orders. Status: {response.status_code}, Message: {response.text}")
+            print(f"Failed to fetch orders from {shop_domain}. Status: {response.status_code}, Message: {response.text}")
             break
 
-    print(f"Total orders fetched: {len(orders)}")
+    print(f"Total orders fetched from {shop_domain}: {len(orders)}")
     return orders
 
-def process_orders(orders, inventory, sold, already_processed_orders):
+
+def process_orders(shop_domain, orders, inventory, sold, already_processed_orders, use_prefix):
     """
-    Process each order to update inventory & sold, build a sales log,
-    and return a list of newly processed order IDs.
+    Processar ordrar för en specifik butik (shop_domain).
+    'use_prefix' avgör om vi ska prefixa order-ID eller inte.
+    Returnerar (new_processed_order_ids, sales_log).
     """
-    print("Processing orders...")
+    print(f"Processing orders for {shop_domain}...")
     new_processed_order_ids = []
     sales_log = {}
 
     for order in orders:
-        order_id_str = str(order['id'])
-        # Skip if already processed
-        if order_id_str in already_processed_orders:
-            continue
+        raw_id = str(order['id'])
 
-        print(f"\nProcessing Order ID: {order_id_str}")
+        # === Skapa unikt order-ID beroende på prefix ===
+        if use_prefix:
+            unique_order_id = f"{shop_domain}_{raw_id}"
+        else:
+            unique_order_id = raw_id  # Butik 1 använder "klassisk" lagring
+
+        if unique_order_id in already_processed_orders:
+            continue  # redan processad
+
+        print(f"\nProcessing Order ID: {unique_order_id}")
         order_date_str = datetime.strptime(
             order['created_at'], "%Y-%m-%dT%H:%M:%S%z"
         ).date().strftime("%Y-%m-%d")
@@ -354,10 +340,11 @@ def process_orders(orders, inventory, sold, already_processed_orders):
             title = item['title']
             quantity = item['quantity']
 
-            # Skip samples
+            # Hoppa över "sample"
             if "sample" in title.lower():
                 continue
 
+            # Bundle?
             if "Fragrance Bundle" in title:
                 print(f"Processing bundle: {title}")
                 perfumes_processed = []
@@ -377,6 +364,7 @@ def process_orders(orders, inventory, sold, already_processed_orders):
                 if len(perfumes_processed) != expected_count:
                     print(f"Warning: Expected {expected_count} in bundle, found {len(perfumes_processed)}.")
             else:
+                # Vanlig produkt
                 perfume_number = extract_perfume_number(title)
                 if perfume_number is not None and perfume_number in inventory:
                     inventory[perfume_number] -= quantity
@@ -387,60 +375,10 @@ def process_orders(orders, inventory, sold, already_processed_orders):
                 else:
                     print(f"Perfume number for '{title}' not found in inventory.")
 
-        # If we get here, we've processed this order
-        new_processed_order_ids.append(order_id_str)
+        # Markera ordern som processad
+        new_processed_order_ids.append(unique_order_id)
 
-    # Batch update the main sheet (inventory/sold)
-    print("Preparing to batch update inventory and sold in the main sheet...")
-    sheet_values = safe_api_call(sheet.get_all_values)
-
-    # Map perfume float => row index (skip the header row)
-    perfume_to_row = {}
-    for row_i, row_data in enumerate(sheet_values, start=1):
-        if row_i == 1:
-            continue
-        if not row_data or len(row_data) < 1:
-            continue
-        try:
-            sheet_perfume_str = row_data[0].strip()
-            sheet_perfume_float = float(sheet_perfume_str)
-            perfume_to_row[sheet_perfume_float] = row_i
-        except ValueError:
-            continue
-
-    inventory_updates = []
-    sold_updates = []
-
-    for perfume_float, new_antal in inventory.items():
-        row_index = perfume_to_row.get(perfume_float)
-        if not row_index:
-            print(f"Perfume {perfume_float} not found in main sheet. Skipping inventory update.")
-            continue
-        inventory_updates.append(gspread.Cell(row_index, 2, new_antal))
-
-    for perfume_float, new_sold in sold.items():
-        row_index = perfume_to_row.get(perfume_float)
-        if not row_index:
-            print(f"Perfume {perfume_float} not found in main sheet. Skipping sold update.")
-            continue
-        sold_updates.append(gspread.Cell(row_index, 3, new_sold))
-
-    if inventory_updates:
-        print(f"Batch updating {len(inventory_updates)} inventory cells...")
-        safe_api_call(sheet.update_cells, inventory_updates)
-
-    if sold_updates:
-        print(f"Batch updating {len(sold_updates)} sold cells...")
-        safe_api_call(sheet.update_cells, sold_updates)
-
-    # Now update Blad2 (daily sales)
-    if sales_log:
-        update_sales_data(sales_log)
-    else:
-        print("No sales data to log in Blad2.")
-
-    print("Order processing completed.")
-    return new_processed_order_ids
+    return new_processed_order_ids, sales_log
 
 ##############################################################################
 #                                   MAIN                                     #
@@ -450,30 +388,95 @@ def main():
     try:
         print("Starting main process...")
 
-        # 1. Ensure our table exists
+        # 1. Säkerställ att tabellen finns
         create_table_if_not_exists()
 
-        # 2. Only process orders from 7 January 2025 at 13:02 onward, for example
+        # 2. Exempel: bearbeta ordrar från 7 januari 2025 kl 13:02
         start_date = datetime(2025, 1, 7, 13, 2)
 
-        # 3. Load processed order IDs from the database
+        # 3. Ladda redan processade order IDs (utan och med prefix)
         processed_orders = load_processed_orders_from_db()
 
-        # 4. Get inventory and sold data from the main sheet
+        # 4. Hämta inventory och sold från Google Sheets (delas av båda butikerna)
         inventory, sold_data = get_inventory_and_sold()
 
-        # 5. Fetch new Shopify orders from the given start date
-        orders = fetch_new_orders(start_date)
-        if orders:
-            # 6. Process them
-            new_processed_ids = process_orders(orders, inventory, sold_data, processed_orders)
+        # Samla upp alla nya processade ID:s
+        all_new_processed_ids = []
 
-            # 7. Save newly processed order IDs back to the DB
-            save_processed_orders_to_db(new_processed_ids)
+        # Vi kan välja att uppdatera "Blad2" direkt efter att varje butik processats,
+        # eller ackumulera i en enda stor sales_log. Här uppdaterar vi efter varje butik.
+        
+        for shop_cfg in SHOPIFY_CONFIGS:
+            shop_domain = shop_cfg["domain"]
+            shopify_access_token = shop_cfg["access_token"]
+            use_prefix = shop_cfg["use_prefix"]
 
-            print("Inventory, sold amounts, and daily sales data updated.")
-        else:
-            print("No new orders found.")
+            # 5. Hämta nya ordrar för denna butik
+            orders = fetch_new_orders(shop_domain, shopify_access_token, start_date)
+            if not orders:
+                print(f"No new orders found for {shop_domain}.")
+                continue
+
+            # 6. Processa ordrar
+            new_ids, sales_log = process_orders(
+                shop_domain, orders, inventory, sold_data,
+                processed_orders, use_prefix
+            )
+            all_new_processed_ids.extend(new_ids)
+
+            # 7a. Spara nydligen processade order-ID i DB
+            save_processed_orders_to_db(new_ids)
+
+            # 7b. Uppdatera Google Sheets "Blad2" (daglig försäljning) för just denna butik
+            if sales_log:
+                update_sales_data(sales_log)
+            else:
+                print(f"No sales data to log for {shop_domain}.")
+
+        # 8. När alla butiker är klara, uppdaterar vi lager ("inventory" + "sold")
+        print("Preparing to batch update inventory and sold in the main sheet...")
+        sheet_values = safe_api_call(sheet.get_all_values)
+
+        # Mappa parfym-float => radindex
+        perfume_to_row = {}
+        for row_i, row_data in enumerate(sheet_values, start=1):
+            if row_i == 1:
+                continue
+            if not row_data or len(row_data) < 1:
+                continue
+            try:
+                sheet_perfume_str = row_data[0].strip()
+                sheet_perfume_float = float(sheet_perfume_str)
+                perfume_to_row[sheet_perfume_float] = row_i
+            except ValueError:
+                continue
+
+        inventory_updates = []
+        sold_updates = []
+
+        for perfume_float, new_antal in inventory.items():
+            row_index = perfume_to_row.get(perfume_float)
+            if not row_index:
+                print(f"Perfume {perfume_float} not found in main sheet. Skipping inventory update.")
+                continue
+            inventory_updates.append(gspread.Cell(row_index, 2, new_antal))
+
+        for perfume_float, new_sold in sold_data.items():
+            row_index = perfume_to_row.get(perfume_float)
+            if not row_index:
+                print(f"Perfume {perfume_float} not found in main sheet. Skipping sold update.")
+                continue
+            sold_updates.append(gspread.Cell(row_index, 3, new_sold))
+
+        if inventory_updates:
+            print(f"Batch updating {len(inventory_updates)} inventory cells...")
+            safe_api_call(sheet.update_cells, inventory_updates)
+
+        if sold_updates:
+            print(f"Batch updating {len(sold_updates)} sold cells...")
+            safe_api_call(sheet.update_cells, sold_updates)
+
+        print("Inventory, sold amounts, and daily sales data updated for both shops.")
 
     except Exception as e:
         print(f"Error in main process: {e}")
@@ -484,4 +487,3 @@ def main():
 if __name__ == "__main__":
     print("Starting script...")
     main()
-
