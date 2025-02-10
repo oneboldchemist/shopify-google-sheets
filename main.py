@@ -7,7 +7,7 @@ import requests
 import gspread
 import psycopg2
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from oauth2client.service_account import ServiceAccountCredentials
 
 ##############################################################################
@@ -260,6 +260,137 @@ def update_sales_data(sales_log):
         print("No cells to update in sales data.")
 
 ##############################################################################
+#                  Ny funktion för rullande 7-dagars snitt                  #
+##############################################################################
+
+def update_7d_rolling_average_in_blad1():
+    """
+    Beräknar och uppdaterar en extra kolumn i Blad1 (kolumn D) med rubriken "Snitt 7d (per dag)",
+    som visar snittförsäljning per dag över de senaste 7 kalenderdagarna.
+    """
+    # Hämta all data från Blad2 (försäljningsloggen)
+    sales_data = safe_api_call(sales_sheet.get_all_values)
+    if not sales_data:
+        print("Blad2 saknar data. Hoppar över 7-dagars uppdatering.")
+        return
+    
+    headers = sales_data[0]  # Första raden i Blad2 (parfymnummer som rubriker)
+    if len(headers) < 2:
+        print("Blad2 saknar giltiga kolumnrubriker. Hoppar över 7-dagars uppdatering.")
+        return
+
+    # Förbered en struktur för försäljning per parfym, per datum
+    # sales_map[ parfym_float ] = { date_obj: antal_sålda, ... }
+    sales_map = {}
+    
+    # Datumintervall: senaste 7 kalenderdagarna, inkl idag
+    today = datetime.now().date()
+    seven_days_ago = today - timedelta(days=6)
+    date_format = "%Y-%m-%d"
+
+    # Hitta parfym-kolumner (dvs headers för parfym-nummer)
+    perfume_columns = []
+    for col_index in range(1, len(headers)):
+        try:
+            perfume_number = float(headers[col_index])  # t.ex. "35" -> 35.0
+            perfume_columns.append((col_index, perfume_number))
+        except ValueError:
+            continue  # hoppa kolumner som ej är parfymnummer
+
+    # Loopa igenom varje rad i Blad2 (förutom headern)
+    for row in sales_data[1:]:
+        if not row or len(row) == 0:
+            continue
+        
+        date_str = row[0].strip()
+        try:
+            row_date = datetime.strptime(date_str, date_format).date()
+        except ValueError:
+            # Ogiltigt datumformat i kolumn A
+            continue
+        
+        if row_date < seven_days_ago or row_date > today:
+            continue  # ligger inte i 7-dagarsfönstret
+        
+        for (c_idx, p_number) in perfume_columns:
+            if c_idx >= len(row):
+                continue
+            cell_value = row[c_idx].strip() if c_idx < len(row) else "0"
+            try:
+                qty_sold = int(cell_value) if cell_value else 0
+            except ValueError:
+                qty_sold = 0
+
+            if p_number not in sales_map:
+                sales_map[p_number] = {}
+            sales_map[p_number][row_date] = sales_map[p_number].get(row_date, 0) + qty_sold
+
+    # Räkna ut snitt per parfym (summa / 7)
+    perfume_7d_avg = {}
+    for p_number, day_dict in sales_map.items():
+        total_7d = 0
+        for d_offset in range(7):  # 0..6
+            check_date = seven_days_ago + timedelta(days=d_offset)
+            total_7d += day_dict.get(check_date, 0)
+        perfume_7d_avg[p_number] = round(total_7d / 7.0, 2)
+
+    # Hämta data från Blad1 för att uppdatera i kolumn D
+    blad1_data = safe_api_call(sheet.get_all_values)
+    if not blad1_data:
+        print("Blad1 saknar data. Hoppar över 7-dagars uppdatering.")
+        return
+
+    # Kontrollera att vi minst har 4 kolumner (A, B, C, D)
+    # och att D1 = "Snitt 7d (per dag)".
+    # Om kolumn D inte finns ska vi skapa den.
+    header_row = blad1_data[0] if blad1_data else []
+    num_cols = len(header_row)
+    desired_header = "Snitt 7d (per dag)"
+
+    if num_cols < 4:
+        # Lägg till kolumner tills vi har minst 4
+        cols_to_add = 4 - num_cols
+        safe_api_call(sheet.add_cols, cols_to_add)
+        # Efter detta är num_cols >= 4
+        num_cols = 4
+        # Hämta om headern på nytt
+        header_row = safe_api_call(sheet.row_values, 1)
+
+    # Sätt text i D1 om den inte redan är "Snitt 7d (per dag)"
+    if len(header_row) < 4 or header_row[3] != desired_header:
+        safe_api_call(sheet.update_cell, 1, 4, desired_header)
+        print(f"Skrev '{desired_header}' i D1.")
+
+    # Bygg mappning parfym_nr -> radindex i Blad1, utgår ifrån kolumn A = "nummer:"
+    perfume_to_row = {}
+    for i, row_data in enumerate(blad1_data, start=1):
+        if i == 1:
+            continue  # header-raden
+        if len(row_data) < 1 or not row_data[0].strip():
+            continue
+        try:
+            p_float = float(row_data[0].strip())  # A-kolumnen tolkas som parfymnr
+            perfume_to_row[p_float] = i
+        except ValueError:
+            pass
+
+    # Uppdatera celler i kolumn D med våra snittvärden
+    cell_updates = []
+    for p_number, avg_value in perfume_7d_avg.items():
+        row_idx = perfume_to_row.get(p_number)
+        if not row_idx:
+            # Parfymen finns inte i Blad1
+            continue
+        # Kolumn D = index 4
+        cell_updates.append(gspread.Cell(row_idx, 4, avg_value))
+
+    if cell_updates:
+        safe_api_call(sheet.update_cells, cell_updates)
+        print(f"Uppdaterade rullande 7-dagars snitt för {len(cell_updates)} parfymer i kolumn D.")
+    else:
+        print("Inga 7-dagarsvärden att uppdatera i kolumn D.")
+
+##############################################################################
 #                           Shopify Order Handling                           #
 ##############################################################################
 
@@ -307,7 +438,6 @@ def fetch_new_orders(shop_domain, shopify_access_token, start_date):
 
     print(f"Total orders fetched from {shop_domain}: {len(orders)}")
     return orders
-
 
 def process_orders(shop_domain, orders, inventory, sold, already_processed_orders, use_prefix):
     """
@@ -403,9 +533,6 @@ def main():
         # Samla upp alla nya processade ID:s
         all_new_processed_ids = []
 
-        # Vi kan välja att uppdatera "Blad2" direkt efter att varje butik processats,
-        # eller ackumulera i en enda stor sales_log. Här uppdaterar vi efter varje butik.
-        
         for shop_cfg in SHOPIFY_CONFIGS:
             shop_domain = shop_cfg["domain"]
             shopify_access_token = shop_cfg["access_token"]
@@ -427,13 +554,13 @@ def main():
             # 7a. Spara nydligen processade order-ID i DB
             save_processed_orders_to_db(new_ids)
 
-            # 7b. Uppdatera Google Sheets "Blad2" (daglig försäljning) för just denna butik
+            # 7b. Uppdatera Google Sheets "Blad2" (daglig försäljning)
             if sales_log:
                 update_sales_data(sales_log)
             else:
                 print(f"No sales data to log for {shop_domain}.")
 
-        # 8. När alla butiker är klara, uppdaterar vi lager ("inventory" + "sold")
+        # 8. Uppdatera lager (inventory + sold) i Blad1
         print("Preparing to batch update inventory and sold in the main sheet...")
         sheet_values = safe_api_call(sheet.get_all_values)
 
@@ -477,6 +604,9 @@ def main():
             safe_api_call(sheet.update_cells, sold_updates)
 
         print("Inventory, sold amounts, and daily sales data updated for both shops.")
+
+        # 9. Uppdatera kolumnen D i Blad1 med 7-dagars snitt
+        update_7d_rolling_average_in_blad1()
 
     except Exception as e:
         print(f"Error in main process: {e}")
