@@ -145,8 +145,16 @@ def extract_perfume_number(value: str):
 #                         Google Sheets Interactions                         #
 ##############################################################################
 
+# "Blad1" (huvudlager)
 sheet = client.open("OBC lager").sheet1
+
+# "Blad2" (alla ordrar, daglig försäljning)
 sales_sheet = client.open("OBC lager").worksheet("Blad2")
+
+# --- NY KOD ---
+# "Blad3" (enbart ordrar till USA)
+sales_sheet_usa = client.open("OBC lager").worksheet("Blad3")
+# --------------
 
 def get_inventory_and_sold():
     print("Fetching inventory and sold amounts from Google Sheets...")
@@ -189,27 +197,39 @@ def get_inventory_and_sold():
     print("Inventory and sold amounts fetched.")
     return inventory, sold_data
 
-def ensure_columns_for_fragrance(fragrance_number_float):
+def ensure_columns_for_fragrance(fragrance_sheet, fragrance_number_float):
+    """
+    Hjälpfunktion för att säkerställa att rätt parfym-kolumn finns i
+    antingen Blad2 eller Blad3 (skickas in som 'fragrance_sheet').
+    """
     fragrance_header_str = format_perfume_number_for_sheet(fragrance_number_float)
-    current_headers = safe_api_call(sales_sheet.row_values, 1)
+    current_headers = safe_api_call(fragrance_sheet.row_values, 1)
     if fragrance_header_str in current_headers:
         return
-    safe_api_call(sales_sheet.add_cols, 1)
+    safe_api_call(fragrance_sheet.add_cols, 1)
     new_col_index = len(current_headers) + 1
-    safe_api_call(sales_sheet.update_cell, 1, new_col_index, fragrance_header_str)
-    print(f"Added column for fragrance '{fragrance_header_str}' at col {new_col_index}.")
+    safe_api_call(fragrance_sheet.update_cell, 1, new_col_index, fragrance_header_str)
+    print(f"Added column for fragrance '{fragrance_header_str}' at col {new_col_index} in sheet '{fragrance_sheet.title}'.")
 
-def find_or_create_row_for_date(date_str, sales_data):
+def find_or_create_row_for_date(fragrance_sheet, date_str, sales_data):
+    """
+    Söker en existerande rad med date_str i första kolumnen,
+    annars infogar en ny rad på rätt datum-sorterad plats.
+    """
     all_dates = [row[0] for row in sales_data]
     if date_str in all_dates:
         return all_dates.index(date_str) + 1
     all_dates_sorted = sorted(all_dates[1:] + [date_str])
     insert_pos = all_dates_sorted.index(date_str) + 2
-    safe_api_call(sales_sheet.insert_row, [date_str], insert_pos)
-    print(f"Inserted a new row for date {date_str} at position {insert_pos}")
+    safe_api_call(fragrance_sheet.insert_row, [date_str], insert_pos)
+    print(f"Inserted a new row for date {date_str} at position {insert_pos} in sheet '{fragrance_sheet.title}'.")
     return insert_pos
 
 def update_sales_data(sales_log):
+    """
+    Uppdaterar Blad2 med ny försäljning från sales_log.
+    sales_log: {datum_str: {parfym_float: antal_sold, ...}, ...}
+    """
     if not sales_log:
         print("No sales data to update in Blad2.")
         return
@@ -222,7 +242,7 @@ def update_sales_data(sales_log):
     cell_updates = []
 
     for date_str, fragrance_dict in sorted_sales_log.items():
-        row_index = find_or_create_row_for_date(date_str, sales_data)
+        row_index = find_or_create_row_for_date(sales_sheet, date_str, sales_data)
         if row_index - 1 >= len(sales_data):
             needed_rows = (row_index - len(sales_data))
             for _ in range(needed_rows):
@@ -230,7 +250,7 @@ def update_sales_data(sales_log):
                 sales_data.append(blank_row)
 
         for fragrance_number_float, qty_sold in fragrance_dict.items():
-            ensure_columns_for_fragrance(fragrance_number_float)
+            ensure_columns_for_fragrance(sales_sheet, fragrance_number_float)
             headers = safe_api_call(sales_sheet.row_values, 1)
 
             fragrance_header_str = format_perfume_number_for_sheet(fragrance_number_float)
@@ -252,12 +272,68 @@ def update_sales_data(sales_log):
             cell_updates.append((row_index, col_index, new_value))
 
     if cell_updates:
-        print(f"Performing batch update of {len(cell_updates)} sales cells...")
+        print(f"Performing batch update of {len(cell_updates)} sales cells (Blad2)...")
         gspread_cells = [gspread.Cell(r, c, val) for (r, c, val) in cell_updates]
         safe_api_call(sales_sheet.update_cells, gspread_cells)
-        print("Sales data updated.")
+        print("Sales data updated in Blad2.")
     else:
-        print("No cells to update in sales data.")
+        print("No cells to update in sales data for Blad2.")
+
+# --- NY KOD ---
+def update_sales_data_usa(sales_log_usa):
+    """
+    Samma logik som update_sales_data, men för Blad3.
+    sales_log_usa: {datum_str: {parfym_float: antal_sold, ...}, ...}
+    """
+    if not sales_log_usa:
+        print("No sales data to update in Blad3.")
+        return
+
+    print("Updating sales data in Blad3 (USA only)...")
+    sales_data = safe_api_call(sales_sheet_usa.get_all_values)
+
+    headers = sales_data[0] if len(sales_data) > 0 else []
+    sorted_sales_log = dict(sorted(sales_log_usa.items()))
+    cell_updates = []
+
+    for date_str, fragrance_dict in sorted_sales_log.items():
+        row_index = find_or_create_row_for_date(sales_sheet_usa, date_str, sales_data)
+        if row_index - 1 >= len(sales_data):
+            needed_rows = (row_index - len(sales_data))
+            for _ in range(needed_rows):
+                blank_row = [''] * max(1, len(headers))
+                sales_data.append(blank_row)
+
+        for fragrance_number_float, qty_sold in fragrance_dict.items():
+            ensure_columns_for_fragrance(sales_sheet_usa, fragrance_number_float)
+            headers = safe_api_call(sales_sheet_usa.row_values, 1)
+
+            fragrance_header_str = format_perfume_number_for_sheet(fragrance_number_float)
+            try:
+                col_index = headers.index(fragrance_header_str) + 1
+            except ValueError:
+                print(f"Could not find header '{fragrance_header_str}' after ensuring columns in Blad3.")
+                continue
+
+            try:
+                cell_obj = safe_api_call(sales_sheet_usa.cell, row_index, col_index)
+                current_value_str = cell_obj.value if cell_obj else ''
+            except Exception as e:
+                print(f"Warning: failed to read cell R{row_index}C{col_index} in Blad3 => {e}")
+                current_value_str = ''
+
+            current_value = int(current_value_str) if current_value_str else 0
+            new_value = current_value + qty_sold
+            cell_updates.append((row_index, col_index, new_value))
+
+    if cell_updates:
+        print(f"Performing batch update of {len(cell_updates)} sales cells (Blad3)...")
+        gspread_cells = [gspread.Cell(r, c, val) for (r, c, val) in cell_updates]
+        safe_api_call(sales_sheet_usa.update_cells, gspread_cells)
+        print("Sales data updated in Blad3.")
+    else:
+        print("No cells to update in sales data for Blad3.")
+# --------------
 
 ##############################################################################
 #                  Ny funktion för rullande 7-dagars snitt                  #
@@ -443,11 +519,16 @@ def process_orders(shop_domain, orders, inventory, sold, already_processed_order
     """
     Processar ordrar för en specifik butik (shop_domain).
     'use_prefix' avgör om vi ska prefixa order-ID eller inte.
-    Returnerar (new_processed_order_ids, sales_log).
+    Returnerar (new_processed_order_ids, sales_log, sales_log_usa).
     """
     print(f"Processing orders for {shop_domain}...")
     new_processed_order_ids = []
     sales_log = {}
+
+    # --- NY KOD ---
+    # Separat försäljningslogg för ordrar med shipping_address i USA
+    sales_log_usa = {}
+    # --------------
 
     for order in orders:
         raw_id = str(order['id'])
@@ -466,6 +547,11 @@ def process_orders(shop_domain, orders, inventory, sold, already_processed_order
             order['created_at'], "%Y-%m-%dT%H:%M:%S%z"
         ).date().strftime("%Y-%m-%d")
 
+        # Kolla om ordern är från USA
+        is_usa_order = False
+        if order.get("shipping_address") and order["shipping_address"].get("country_code") == "US":
+            is_usa_order = True
+
         for item in order['line_items']:
             title = item['title']
             quantity = item['quantity']
@@ -481,15 +567,26 @@ def process_orders(shop_domain, orders, inventory, sold, already_processed_order
                 for prop in item['properties']:
                     perfume_number = extract_perfume_number(prop['value'])
                     if perfume_number is not None and perfume_number in inventory:
+                        # Minska lager
                         inventory[perfume_number] -= quantity
                         sold[perfume_number] += quantity
+                        # Logga i "vanliga" sales_log (Blad2)
                         sales_log.setdefault(order_date_str, {}).setdefault(perfume_number, 0)
                         sales_log[order_date_str][perfume_number] += quantity
+
+                        # --- NY KOD ---
+                        if is_usa_order:
+                            # Logga även i sales_log_usa (Blad3)
+                            sales_log_usa.setdefault(order_date_str, {}).setdefault(perfume_number, 0)
+                            sales_log_usa[order_date_str][perfume_number] += quantity
+                        # -------------
+
                         perfumes_processed.append(perfume_number)
                         print(f"Perfume {perfume_number} => new inventory: {inventory[perfume_number]}")
                     else:
                         print(f"Perfume number '{prop['value']}' not found in inventory.")
 
+                # Kolla om det var 3 eller 2 parfymer i bundle
                 expected_count = 3 if "3x" in title else 2
                 if len(perfumes_processed) != expected_count:
                     print(f"Warning: Expected {expected_count} in bundle, found {len(perfumes_processed)}.")
@@ -499,8 +596,18 @@ def process_orders(shop_domain, orders, inventory, sold, already_processed_order
                 if perfume_number is not None and perfume_number in inventory:
                     inventory[perfume_number] -= quantity
                     sold[perfume_number] += quantity
+
+                    # Logga i "vanliga" sales_log (Blad2)
                     sales_log.setdefault(order_date_str, {}).setdefault(perfume_number, 0)
                     sales_log[order_date_str][perfume_number] += quantity
+
+                    # --- NY KOD ---
+                    if is_usa_order:
+                        # Logga även i sales_log_usa (Blad3)
+                        sales_log_usa.setdefault(order_date_str, {}).setdefault(perfume_number, 0)
+                        sales_log_usa[order_date_str][perfume_number] += quantity
+                    # -------------
+
                     print(f"Perfume {perfume_number} => new inventory: {inventory[perfume_number]}")
                 else:
                     print(f"Perfume number for '{title}' not found in inventory.")
@@ -508,7 +615,8 @@ def process_orders(shop_domain, orders, inventory, sold, already_processed_order
         # Markera ordern som processad
         new_processed_order_ids.append(unique_order_id)
 
-    return new_processed_order_ids, sales_log
+    # Returnerar två separata försäljningsloggar
+    return new_processed_order_ids, sales_log, sales_log_usa
 
 ##############################################################################
 #                                   MAIN                                     #
@@ -533,6 +641,13 @@ def main():
         # Samla upp alla nya processade ID:s
         all_new_processed_ids = []
 
+        # Samlar även upp all försäljning i en gemensam dictionary (vanlig)
+        total_sales_log = {}
+        # --- NY KOD ---
+        # Samlar upp all försäljning i en gemensam dictionary (bara USA)
+        total_sales_log_usa = {}
+        # --------------
+
         for shop_cfg in SHOPIFY_CONFIGS:
             shop_domain = shop_cfg["domain"]
             shopify_access_token = shop_cfg["access_token"]
@@ -545,20 +660,44 @@ def main():
                 continue
 
             # 6. Processa ordrar
-            new_ids, sales_log = process_orders(
+            new_ids, sales_log, sales_log_usa = process_orders(
                 shop_domain, orders, inventory, sold_data,
                 processed_orders, use_prefix
             )
             all_new_processed_ids.extend(new_ids)
 
-            # 7a. Spara nydligen processade order-ID i DB
-            save_processed_orders_to_db(new_ids)
+            # Slå ihop shopspecifik försäljning med totalen
+            # (nyckel = datum, value = {parfymnr: qty})
+            for date_str, fdict in sales_log.items():
+                total_sales_log.setdefault(date_str, {})
+                for pnr, qty in fdict.items():
+                    total_sales_log[date_str].setdefault(pnr, 0)
+                    total_sales_log[date_str][pnr] += qty
 
-            # 7b. Uppdatera Google Sheets "Blad2" (daglig försäljning)
-            if sales_log:
-                update_sales_data(sales_log)
-            else:
-                print(f"No sales data to log for {shop_domain}.")
+            # --- NY KOD: USA-sammanställning ---
+            for date_str, fdict in sales_log_usa.items():
+                total_sales_log_usa.setdefault(date_str, {})
+                for pnr, qty in fdict.items():
+                    total_sales_log_usa[date_str].setdefault(pnr, 0)
+                    total_sales_log_usa[date_str][pnr] += qty
+            # -----------------------------------
+
+        # 7a. Spara nydligen processade order-ID i DB
+        save_processed_orders_to_db(all_new_processed_ids)
+
+        # 7b. Uppdatera Google Sheets "Blad2" (daglig försäljning, alla ordrar)
+        if total_sales_log:
+            update_sales_data(total_sales_log)
+        else:
+            print("No overall sales data to log in Blad2.")
+
+        # --- NY KOD ---
+        # 7c. Uppdatera Google Sheets "Blad3" (daglig försäljning, endast USA)
+        if total_sales_log_usa:
+            update_sales_data_usa(total_sales_log_usa)
+        else:
+            print("No USA sales data to log in Blad3.")
+        # --------------
 
         # 8. Uppdatera lager (inventory + sold) i Blad1
         print("Preparing to batch update inventory and sold in the main sheet...")
