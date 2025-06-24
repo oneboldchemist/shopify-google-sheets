@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Shopify-synk som *tillåter negativa lager*.
-
-• Master = Butik 1
-• Försäljning i butik 2 justeras relativt i master (±),
-  även om resultatet blir < 0.
-• Slutsteget synkar *differensen* med inventory_levels/adjust.
-  > Går saldot negativt i master → sekundär får samma negativa värde.
+Shopify-synk som tillåter negativa lager
+och klarar 'None' i available-fältet.
 """
 
 ##############################################################################
@@ -16,23 +11,19 @@ Shopify-synk som *tillåter negativa lager*.
 
 import os, sys, time, json, psycopg2, requests
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 ##############################################################################
 # Konfig
 ##############################################################################
 
-API_VERSION = "2023-07"
-
-SHOP_DOMAIN_1          = os.getenv("SHOP_DOMAIN_1")          or "first-shop.myshopify.com"
+API_VERSION          = "2023-07"
+SHOP_DOMAIN_1        = os.getenv("SHOP_DOMAIN_1")        or "first-shop.myshopify.com"
 SHOPIFY_ACCESS_TOKEN_1 = os.getenv("SHOPIFY_ACCESS_TOKEN_1") or "token-shop-1"
-
-SHOP_DOMAIN_2          = os.getenv("SHOP_DOMAIN_2")          or "second-shop.myshopify.com"
+SHOP_DOMAIN_2        = os.getenv("SHOP_DOMAIN_2")        or "second-shop.myshopify.com"
 SHOPIFY_ACCESS_TOKEN_2 = os.getenv("SHOPIFY_ACCESS_TOKEN_2") or "token-shop-2"
-
-DATABASE_URL           = os.getenv("DATABASE_URL")           or "postgres://..."
-
-LOOKBACK_HOURS         = int(os.getenv("SYNC_LOOKBACK_HOURS", "24"))
+DATABASE_URL         = os.getenv("DATABASE_URL")         or "postgres://..."
+LOOKBACK_HOURS       = int(os.getenv("SYNC_LOOKBACK_HOURS", "24"))
 
 ##############################################################################
 # DB-hjälp
@@ -70,8 +61,8 @@ def shopify_request(
     token: str,
     method: str,
     path: str,
-    params: dict | None = None,
-    payload: dict | None = None,
+    params: Optional[dict] = None,
+    payload: Optional[dict] = None,
 ) -> requests.Response:
     url = f"https://{shop}/admin/api/{API_VERSION}{path}"
     headers = {
@@ -89,7 +80,7 @@ def shopify_request(
         return resp
 
 ##############################################################################
-# Hjälpfunktioner för varianter & lager
+# Variant- & lager-hjälp
 ##############################################################################
 
 def get_primary_location_id(shop: str, token: str) -> int:
@@ -99,7 +90,7 @@ def get_primary_location_id(shop: str, token: str) -> int:
             return loc["id"]
     return resp.json()["locations"][0]["id"]
 
-VariantInfo = Tuple[int, int]         # (inventory_item_id, variant_id)
+VariantInfo = Tuple[int, int]  # (inventory_item_id, variant_id)
 
 def fetch_variants_by_sku(shop: str, token: str) -> Dict[str, VariantInfo]:
     out: Dict[str, VariantInfo] = {}
@@ -126,25 +117,29 @@ def fetch_inventory_levels(
     location_id: int,
     variants_map: Dict[str, VariantInfo],
 ) -> Dict[str, int]:
+    """
+    Returnerar dict SKU -> available (int).
+    Om available är None returneras 0.
+    """
     result: Dict[str, int] = {}
     ids = [str(iid) for iid, _ in variants_map.values()]
     for i in range(0, len(ids), 50):
-        chunk = ",".join(ids[i:i+50])
+        chunk = ",".join(ids[i : i + 50])
         resp = shopify_request(
             shop, token, "GET", "/inventory_levels.json",
             params={"inventory_item_ids": chunk, "location_ids": location_id},
         )
         for lvl in resp.json()["inventory_levels"]:
+            qty = lvl.get("available")
             inv_item_id = lvl["inventory_item_id"]
-            qty = lvl["available"]
             for sku, (iid, _) in variants_map.items():
                 if iid == inv_item_id:
-                    result[sku] = qty
+                    result[sku] = int(qty) if qty is not None else 0
                     break
     return result
 
 ##############################################################################
-# Säkerställ tracking & location
+# Tracking & location-säkring
 ##############################################################################
 
 def ensure_variant_is_trackable(shop: str, token: str, variant_id: int):
@@ -155,7 +150,7 @@ def ensure_variant_is_trackable(shop: str, token: str, variant_id: int):
         shop, token, "PUT", f"/variants/{variant_id}.json",
         payload={"variant": {"id": variant_id, "inventory_management": "shopify"}},
     )
-    print(f"✅ track_quantity ON för variant {variant_id} i {shop}")
+    print(f"✅ Track quantity ON för variant {variant_id} i {shop}")
 
 def connect_if_needed(shop: str, token: str, inv_item_id: int, location_id: int):
     try:
@@ -165,45 +160,33 @@ def connect_if_needed(shop: str, token: str, inv_item_id: int, location_id: int)
         )
         print(f"🔗 inventory_item {inv_item_id} kopplad till location {location_id} ({shop})")
     except RuntimeError as e:
-        if "422" not in str(e):  # 422 betyder redan kopplad
+        if "422" not in str(e):  # redan kopplad
             raise
 
 ##############################################################################
-# Lager-operationer som tillåter negativa värden
+# Lager-operationer
 ##############################################################################
 
-def adjust_inventory(
-    shop: str,
-    token: str,
-    inv_item_id: int,
-    location_id: int,
-    diff: int,
-):
+def adjust_inventory(shop: str, token: str, inv_item_id: int, location_id: int, diff: int):
     if diff == 0:
         return
     payload = {
-        "location_id": location_id,
-        "inventory_item_id": inv_item_id,
+        "location_id":          location_id,
+        "inventory_item_id":    inv_item_id,
         "available_adjustment": diff,
     }
     shopify_request(shop, token, "POST", "/inventory_levels/adjust.json", payload=payload)
 
-def force_set_inventory(
-    shop: str,
-    token: str,
-    inv_item_id: int,
-    location_id: int,
-    new_qty: int,
-):
+def force_set_inventory(shop: str, token: str, inv_item_id: int, location_id: int, qty: int):
     payload = {
-        "location_id": location_id,
+        "location_id":       location_id,
         "inventory_item_id": inv_item_id,
-        "available": new_qty,
+        "available":         qty,
     }
     shopify_request(shop, token, "POST", "/inventory_levels/set.json", payload=payload)
 
 ##############################################################################
-# Order-hämtning & process
+# Orders
 ##############################################################################
 
 def fetch_new_orders(shop: str, token: str, since: datetime) -> List[dict]:
@@ -253,7 +236,7 @@ def process_orders_from_secondary(
     return new_ids
 
 ##############################################################################
-# Synk master → sekundär  (differens-logik, tillåter minus)
+# Synk-funktion
 ##############################################################################
 
 def sync_master_to_secondary(
@@ -266,33 +249,34 @@ def sync_master_to_secondary(
     secondary_loc: int,
     variants_secondary: Dict[str, VariantInfo],
 ):
-    updates = 0
-    # hämta aktuella sekundär-saldon
-    sec_qty = fetch_inventory_levels(
-        secondary_shop, secondary_token, secondary_loc, variants_secondary
-    )
+    # Läs sekundär-saldo en gång
+    sec_qty = fetch_inventory_levels(secondary_shop, secondary_token, secondary_loc, variants_secondary)
 
+    updates = 0
     for sku, master_val in master_qty.items():
         if sku not in variants_secondary:
             continue
+
+        master_val = master_val if master_val is not None else 0
         current_sec = sec_qty.get(sku, 0)
+        current_sec = current_sec if current_sec is not None else 0
         diff = master_val - current_sec
         if diff == 0:
             continue
 
         inv_item_id, variant_id = variants_secondary[sku]
 
-        # säkerställ tracking & koppling
         ensure_variant_is_trackable(secondary_shop, secondary_token, variant_id)
         connect_if_needed(secondary_shop, secondary_token, inv_item_id, secondary_loc)
 
         try:
             adjust_inventory(secondary_shop, secondary_token, inv_item_id, secondary_loc, diff)
         except RuntimeError as e:
-            print(f"⚠️ adjust misslyckades för SKU {sku} ({e}); försöker set ...")
+            print(f"⚠️ adjust misslyckades för SKU {sku} ({e}); fallback set→{master_val}")
             force_set_inventory(secondary_shop, secondary_token, inv_item_id, secondary_loc, master_val)
 
         updates += 1
+
     print(f"Lager uppdaterat i {secondary_shop} för {updates} SKU:er.")
 
 ##############################################################################
@@ -300,27 +284,26 @@ def sync_master_to_secondary(
 ##############################################################################
 
 def main():
-    print("=== Shopify-synk (negativa saldo) startar ===")
+    print("=== Shopify-synk (negativa saldo + None-skydd) startar ===")
 
     create_table_if_not_exists()
     processed = load_processed_orders()
     since     = datetime.utcnow() - timedelta(hours=LOOKBACK_HOURS)
 
-    # Förbered master
+    # Master-data
     loc1      = get_primary_location_id(SHOP_DOMAIN_1, SHOPIFY_ACCESS_TOKEN_1)
     variants1 = fetch_variants_by_sku(SHOP_DOMAIN_1, SHOPIFY_ACCESS_TOKEN_1)
 
     loc2      = get_primary_location_id(SHOP_DOMAIN_2, SHOPIFY_ACCESS_TOKEN_2)
     variants2 = fetch_variants_by_sku(SHOP_DOMAIN_2, SHOPIFY_ACCESS_TOKEN_2)
 
-    # Hämta ordrar
+    # Ordrar
     ord1 = fetch_new_orders(SHOP_DOMAIN_1, SHOPIFY_ACCESS_TOKEN_1, since)
     ord2 = fetch_new_orders(SHOP_DOMAIN_2, SHOPIFY_ACCESS_TOKEN_2, since)
 
-    # Markera butik 1-ordrar som processade
+    # Processera
     new_ids_1 = [str(o["id"]) for o in ord1 if str(o["id"]) not in processed]
 
-    # Justera master för butik 2-försäljning
     new_ids_2 = process_orders_from_secondary(
         secondary_shop  = SHOP_DOMAIN_2,
         secondary_token = SHOPIFY_ACCESS_TOKEN_2,
@@ -336,10 +319,8 @@ def main():
     save_processed_orders(new_ids_1 + new_ids_2)
     print(f"Nya order-ID sparade: {len(new_ids_1) + len(new_ids_2)} st")
 
-    # Synka differenser (kan bli negativa)
-    master_qty = fetch_inventory_levels(
-        SHOP_DOMAIN_1, SHOPIFY_ACCESS_TOKEN_1, loc1, variants1
-    )
+    # Synka differenser
+    master_qty = fetch_inventory_levels(SHOP_DOMAIN_1, SHOPIFY_ACCESS_TOKEN_1, loc1, variants1)
     sync_master_to_secondary(
         SHOP_DOMAIN_1, SHOPIFY_ACCESS_TOKEN_1, loc1, master_qty,
         SHOP_DOMAIN_2, SHOPIFY_ACCESS_TOKEN_2, loc2, variants2,
