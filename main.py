@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Shopify-lager-synk (v3.2, 2025-06-25)
--------------------------------------
+Shopify-lager-synk  v3.3   (2025-06-25)
+---------------------------------------
 • Butik 1 = master
-• Full tvåvägssynk
-• Idempotent per order-rad
-• Robust mot decimalvärden (’2.0’ → 2)
+• Full tvåvägssynk med idempotens per order-rad
+• Robust mot decimalsträngar (”2.0”) på quantity, inventory och ID-fält
+• Skydd mot negativa saldon (kan stängas av med ALLOW_NEGATIVE=true)
+• DRY_RUN-läge för säker test
 """
 
 #######################################################################
@@ -14,14 +15,14 @@ Shopify-lager-synk (v3.2, 2025-06-25)
 #######################################################################
 import os, sys, time, requests, psycopg2, decimal, re
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Tuple, List, Optional
 
-API_VERSION    = "2023-10"
+API_VERSION    = "2023-10"                   # senast godkända REST-version
 SHOP_1         = os.environ["SHOP_DOMAIN_1"]
 TOKEN_1        = os.environ["SHOPIFY_ACCESS_TOKEN_1"]
 SHOP_2         = os.environ["SHOP_DOMAIN_2"]
 TOKEN_2        = os.environ["SHOPIFY_ACCESS_TOKEN_2"]
-DATABASE_URL   = os.environ["DATABASE_URL"]
+DATABASE_URL   = os.environ["DATABASE_URL"]  # postgres://…
 LOOKBACK_HOURS = int(os.getenv("SYNC_LOOKBACK_HOURS", "24"))
 ALLOW_NEG      = os.getenv("ALLOW_NEGATIVE", "false").lower() == "true"
 DRY_RUN        = os.getenv("MODE", "LIVE") == "DRY_RUN"
@@ -30,13 +31,13 @@ DRY_RUN        = os.getenv("MODE", "LIVE") == "DRY_RUN"
 # Utils
 #######################################################################
 def log(msg: str, *, level: str = "INFO"):
-    ts = datetime.now().strftime("%H:%M:%S")
-    clr = {"INFO": "37", "WARN": "33", "ERR": "31"}[level]
-    print(f"\x1b[{clr}m[{ts}] {msg}\x1b[0m")
+    now = datetime.now().strftime("%H:%M:%S")
+    colour = {"INFO": "37", "WARN": "33", "ERR": "31"}[level]
+    print(f"\x1b[{colour}m[{now}] {msg}\x1b[0m")
 
 _dec_re = re.compile(r"^-?\d+(?:[.,]\d+)?$")
 def to_int(val) -> int:
-    """Konverterar str/float/Decimal → int, säkert även för '2.0'."""
+    """Konverterar val till heltal. Hanterar '2', '2.0', '2,0', Decimal, float."""
     if val is None:
         return 0
     if isinstance(val, int):
@@ -45,25 +46,24 @@ def to_int(val) -> int:
         return int(round(val))
     if isinstance(val, str) and _dec_re.match(val.strip()):
         return int(decimal.Decimal(val.replace(",", ".")))
-    # Ogiltigt – logga en varning men krascha inte
     log(f"⚠️  ogiltigt heltal: {val!r}", level="WARN")
     return 0
 
 #######################################################################
-# Shopify-wrapper (oförändrad)
+# Shopify-wrapper
 #######################################################################
 def shopify(
     shop: str, token: str, method: str, path: str,
     params: Optional[dict] = None, payload: Optional[dict] = None
 ) -> requests.Response:
     url = f"https://{shop}/admin/api/{API_VERSION}{path}"
-    hdr = {
+    headers = {
         "X-Shopify-Access-Token": token,
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
     while True:
-        r = requests.request(method, url, headers=hdr,
+        r = requests.request(method, url, headers=headers,
                              params=params, json=payload, timeout=30)
         if r.status_code == 429:
             time.sleep(int(r.headers.get("Retry-After", 2)))
@@ -73,18 +73,18 @@ def shopify(
         return r
 
 #######################################################################
-# Databas – samma som v3.1 (kortat här för läsbarhet)
+# Databas  (idempotent spårning av order-rader)
 #######################################################################
 def db(q: str, vals: tuple | list = (), fetch: bool = False):
-    with psycopg2.connect(DATABASE_URL) as c, c.cursor() as cur:
+    with psycopg2.connect(DATABASE_URL) as conn, conn.cursor() as cur:
         cur.execute(q, vals)
         if fetch:
             return cur.fetchall()
 
 def init_db():
     db("""CREATE TABLE IF NOT EXISTS processed_lines (
-            shop TEXT NOT NULL,
-            line_id BIGINT NOT NULL,
+            shop     TEXT   NOT NULL,
+            line_id  BIGINT NOT NULL,
             PRIMARY KEY (shop, line_id)
           );""")
 
@@ -92,26 +92,27 @@ def is_done(shop: str, lid: int) -> bool:
     return bool(db("SELECT 1 FROM processed_lines WHERE shop=%s AND line_id=%s;",
                    (shop, lid), fetch=True))
 
-def mark_done(shop: str, lids: list[int]):
-    if not lids:
+def mark_done(shop: str, lids: List[int | str]):
+    clean = [to_int(l) for l in lids if to_int(l) != 0]
+    if not clean:
         return
-    with psycopg2.connect(DATABASE_URL) as c, c.cursor() as cur:
+    with psycopg2.connect(DATABASE_URL) as conn, conn.cursor() as cur:
         cur.executemany(
             "INSERT INTO processed_lines (shop, line_id) VALUES (%s,%s) "
             "ON CONFLICT DO NOTHING;",
-            [(shop, lid) for lid in lids]
+            [(shop, lid) for lid in clean]
         )
 
 #######################################################################
-# Variant- och lager-hjälp (int-konvertering fixad)
+# Variant- och lager-rutiner
 #######################################################################
-Variant = Tuple[int, int]
+Variant = Tuple[int, int]              # (inventory_item_id, variant_id)
 
 def primary_location(shop: str, tok: str) -> int:
     locs = shopify(shop, tok, "GET", "/locations.json").json()["locations"]
-    for l in locs:
-        if l.get("primary"):
-            return l["id"]
+    for loc in locs:
+        if loc.get("primary"):
+            return loc["id"]
     return locs[0]["id"]
 
 def variants_by_sku(shop: str, tok: str) -> Dict[str, Variant]:
@@ -135,7 +136,7 @@ def variants_by_sku(shop: str, tok: str) -> Dict[str, Variant]:
 def inventory(shop: str, tok: str, loc: int,
               vmap: Dict[str, Variant]) -> Dict[str, int]:
     out: Dict[str, int] = {}
-    ids = [str(i) for i, _ in vmap.values()]
+    ids = [str(iid) for iid, _ in vmap.values()]
     for i in range(0, len(ids), 50):
         chunk = ",".join(ids[i:i+50])
         levels = shopify(
@@ -178,10 +179,10 @@ def adjust(shop: str, tok: str, loc: int, iid: int, delta: int, sku: str):
     log(f"    ↳ justerade {delta:+}  (SKU {sku})")
 
 #######################################################################
-# Order-hämtning & rad-processing (int-konvertering fixad)
+# Order-hämtning & rad-processing
 #######################################################################
-def fetch_orders(shop: str, tok: str, since: datetime) -> list[dict]:
-    out: list[dict] = []
+def fetch_orders(shop: str, tok: str, since: datetime) -> List[dict]:
+    out: List[dict] = []
     path, params = "/orders.json", {
         "status": "any", "limit": 250, "created_at_min": since.isoformat()
     }
@@ -197,7 +198,7 @@ def fetch_orders(shop: str, tok: str, since: datetime) -> list[dict]:
     return out
 
 def handle_outgoing(
-    orders: list[dict],
+    orders: List[dict],
     shop_src: str,
     shop_dst: str,
     tok_dst: str,
@@ -210,13 +211,18 @@ def handle_outgoing(
         if o.get("cancelled_at"):
             continue
         for li in o.get("line_items", []):
-            lid = li["id"]
+            lid_raw = li["id"]
+            lid = to_int(lid_raw)
+            if lid == 0:
+                log(f"⚠️  Rad-ID ogiltigt ({lid_raw!r}) – hoppar", level="WARN")
+                continue
             if is_done(shop_src, lid):
                 continue
+
             qty = to_int(li.get("quantity"))
             if qty <= 0:
-                done.append(lid)
-                continue
+                done.append(lid); continue
+
             sku = (li.get("sku") or "").strip()
             if not sku or sku not in vmap_dst:
                 log(f"⚠️  Hoppar rad {lid}: ogiltig SKU {sku}", level="WARN")
@@ -232,32 +238,45 @@ def handle_outgoing(
             if after < 0 and not ALLOW_NEG:
                 delta = -before
                 after = 0
+
             log(f"{shop_src} order {lid}: SKU {sku} qty {qty} → diff {delta:+}")
             adjust(shop_dst, tok_dst, loc_dst, iid, delta, sku)
             qty_dst[sku] = after
             done.append(lid)
+
     mark_done(shop_src, done)
 
 #######################################################################
-# Full-synk & MAIN – oförändrade från v3.1 (förkortade här)
+# Full-synk master → sekundär
 #######################################################################
-def full_sync(src_qty, dst_shop, dst_tok, dst_loc, dst_vmap):
-    diff_cnt = 0
+def full_sync(
+    src_qty: Dict[str, int],
+    dst_shop: str,
+    dst_tok: str,
+    dst_loc: int,
+    dst_vmap: Dict[str, Variant],
+):
+    updates = 0
     dst_qty = inventory(dst_shop, dst_tok, dst_loc, dst_vmap)
-    for sku, val in src_qty.items():
+
+    for sku, master_val in src_qty.items():
         if sku not in dst_vmap:
             continue
-        gap = val - dst_qty.get(sku, 0)
-        if gap == 0:
+        diff = master_val - dst_qty.get(sku, 0)
+        if diff == 0:
             continue
         iid, vid = dst_vmap[sku]
         ensure_trackable(dst_shop, dst_tok, vid)
         connect(dst_shop, dst_tok, iid, dst_loc)
-        log(f"Full synk {dst_shop}: SKU {sku} diff {gap:+}")
-        adjust(dst_shop, dst_tok, dst_loc, iid, gap, sku)
-        diff_cnt += 1
-    log(f"✓ Full synk klar – {diff_cnt} SKU:er uppdaterade i {dst_shop}")
+        log(f"Full synk {dst_shop}: SKU {sku} diff {diff:+}")
+        adjust(dst_shop, dst_tok, dst_loc, iid, diff, sku)
+        updates += 1
 
+    log(f"✓ Full synk klar – {updates} SKU:er uppdaterade i {dst_shop}")
+
+#######################################################################
+# MAIN
+#######################################################################
 def main():
     init_db()
     since = datetime.utcnow() - timedelta(hours=LOOKBACK_HOURS)
@@ -274,17 +293,21 @@ def main():
     ord1 = fetch_orders(SHOP_1, TOKEN_1, since)
     ord2 = fetch_orders(SHOP_2, TOKEN_2, since)
 
+    # Order i sekundär butik drar master-lagret
     handle_outgoing(ord2, SHOP_2, SHOP_1, TOKEN_1, loc1, v1, q1)
+    # Returer / negativa rader i master kan påverka sekundär
     handle_outgoing(ord1, SHOP_1, SHOP_2, TOKEN_2, loc2, v2, q2)
 
+    # Tabell-synk master → sekundär
     full_sync(q1, SHOP_2, TOKEN_2, loc2, v2)
 
     log("=== Synk klar ===")
 
 if __name__ == "__main__":
     try:
-        log(f"=== Shopify-synk (v3.2) startar – {'TEST' if DRY_RUN else 'LIVE'} ===")
+        mode = "TEST-läge" if DRY_RUN else "LIVE"
+        log(f"=== Shopify-synk (v3.3) startar – {mode} ===")
         main()
-    except Exception as e:
-        log(f"❌ Fatalt fel: {e}", level="ERR")
+    except Exception as err:
+        log(f"❌ Fatalt fel: {err}", level="ERR")
         sys.exit(1)
