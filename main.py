@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Shopify-lager — Butik 2 → Butik 1-balansering MED FULL VERBOSITET  v1.1  (2025-06-25)
---------------------------------------------------------------------------------------
-• Butik 1 = master-lager
-• Steg 1: summera utförsäljning i Butik 2 sedan senaste körning
-• Steg 2: dra av den mängden från Butik 1-lagret
-• Steg 3: sätt Butik 2-lagret = aktuellt Butik 1-lager
-• Skriver UT ALLT (ordrar, varje rad, lager innan/efter, alla justeringar)
-• Idempotent per order-rad (PostgreSQL-tabell)
+Shopify-lager — Butik 2 → Butik 1-balansering  **v1.2**  (2025-06-25)
+---------------------------------------------------------------------
+• Butik 1 = master-lager  
+• Steg 1: summera utförsäljning i Butik 2 sedan senaste körning  
+• Steg 2: dra av den mängden från Butik 1-lagret  
+• Steg 3: sätt Butik 2-lagret = aktuellt Butik 1-lager  
+• Idempotent per order-rad (tabell *processed_lines*)  
+• FULL VERBOSITET – visar även när rader hoppas över  
 • DRY_RUN-läge för säker test
 """
 
@@ -33,9 +33,9 @@ DRY_RUN        = os.getenv("MODE", "LIVE") == "DRY_RUN"
 # Bas-verktyg
 #######################################################################
 def log(msg: str, level: str = "INFO"):
-    colour = {"INFO": "37", "WARN": "33", "ERR": "31", "DEBUG": "36"}[level]
+    colours = {"INFO": "37", "WARN": "33", "ERR": "31", "DEBUG": "36"}
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"\x1b[{colour}m[{ts}] {msg}\x1b[0m", flush=True)
+    print(f"\x1b[{colours.get(level,'37')}m[{ts}] {msg}\x1b[0m", flush=True)
 
 _dec = re.compile(r"^-?\d+(?:[.,]\d+)?$")
 def to_int(v) -> int:
@@ -46,8 +46,8 @@ def to_int(v) -> int:
         return int(decimal.Decimal(v.replace(",", ".")))
     log(f"Ogiltigt tal: {v!r}", "WARN"); return 0
 
-def pretty(obj):
-    return json.dumps(obj, indent=2, ensure_ascii=False, default=str)
+def pretty(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=2, default=str)
 
 #######################################################################
 # Shopify-hjälpare
@@ -63,31 +63,36 @@ def shopify(shop: str, token: str, method: str, path: str,
                              params=params, json=payload, timeout=30)
         if r.status_code == 429:
             wait = int(r.headers.get("Retry-After", 2))
-            log(f"Rate-limited {shop} – väntar {wait}s", "DEBUG"); time.sleep(wait); continue
+            log(f"{shop}: rate-limited, väntar {wait}s", "DEBUG"); time.sleep(wait); continue
         if r.status_code >= 300:
             raise RuntimeError(f"{shop} {method} {path} → {r.status_code}: {r.text}")
         return r
 
 #######################################################################
-# DB: spåra hanterade order-rader
+# DB – idempotent spårning av order-rader
 #######################################################################
 def db(sql: str, vals: tuple = (), fetch=False):
-    with psycopg2.connect(DATABASE_URL) as c, c.cursor() as cur:
+    with psycopg2.connect(DATABASE_URL) as conn, conn.cursor() as cur:
         cur.execute(sql, vals)
         return cur.fetchall() if fetch else None
 
 def init_db():
-    db("""CREATE TABLE IF NOT EXISTS processed_lines (
-            shop TEXT NOT NULL, line_id BIGINT NOT NULL,
-            PRIMARY KEY (shop, line_id));""")
+    db("""
+        CREATE TABLE IF NOT EXISTS processed_lines (
+            shop TEXT NOT NULL,
+            line_id BIGINT NOT NULL,
+            PRIMARY KEY (shop, line_id)
+        );
+    """)
 
 def mark_done(shop: str, lids: List[int]):
     if not lids: return
-    data = [(shop, i) for i in lids]
-    with psycopg2.connect(DATABASE_URL) as c, c.cursor() as cur:
-        cur.executemany("""INSERT INTO processed_lines (shop,line_id)
-                           VALUES (%s,%s) ON CONFLICT DO NOTHING;""", data)
-    log(f"{shop}: markerade {len(lids)} rader som färdiga", "DEBUG")
+    with psycopg2.connect(DATABASE_URL) as conn, conn.cursor() as cur:
+        cur.executemany("""
+            INSERT INTO processed_lines (shop, line_id)
+            VALUES (%s, %s) ON CONFLICT DO NOTHING;
+        """, [(shop, lid) for lid in lids])
+    log(f"{shop}: markerade {len(lids)} rader som behandlade", "DEBUG")
 
 def done(shop: str, lid: int) -> bool:
     return bool(db("SELECT 1 FROM processed_lines WHERE shop=%s AND line_id=%s;",
@@ -112,11 +117,11 @@ def variants_by_sku(shop: str, tok: str) -> Dict[str, Variant]:
             for v in p["variants"]:
                 sku = (v["sku"] or "").strip()
                 if sku: res[sku] = (v["inventory_item_id"], v["id"])
-        link = r.headers.get("Link")
-        if link and 'rel="next"' in link:
-            path = link.split(";")[0].strip("<>").split(API_VERSION)[1]; params = {}
+        nxt = r.headers.get("Link")
+        if nxt and 'rel="next"' in nxt:
+            path = nxt.split(";")[0].strip("<>").split(API_VERSION)[1]; params = {}
         else: break
-    log(f"{shop}: hittade {len(res)} sku-varianter", "DEBUG")
+    log(f"{shop}: hittade {len(res)} SKU-varianter", "DEBUG")
     return res
 
 def inventory(shop: str, tok: str, loc: int,
@@ -138,36 +143,37 @@ def ensure_trackable(shop: str, tok: str, vid: int):
     if v["inventory_management"] != "shopify":
         shopify(shop, tok, "PUT", f"/variants/{vid}.json",
                 payload={"variant": {"id": vid, "inventory_management": "shopify"}})
-        log(f"{shop}: inventory_management satt till shopify för variant {vid}", "DEBUG")
+        log(f"{shop}: inventory_management → shopify för variant {vid}", "DEBUG")
 
 def connect(shop: str, tok: str, iid: int, loc: int):
     try:
         shopify(shop, tok, "POST", "/inventory_levels/connect.json",
                 payload={"location_id": loc, "inventory_item_id": iid})
-        log(f"{shop}: kopplade inventory_item {iid} till loc {loc}", "DEBUG")
+        log(f"{shop}: connect inventory_item {iid} → loc {loc}", "DEBUG")
     except RuntimeError as e:
         if "422" not in str(e): raise
 
-def adjust(shop: str, tok: str, loc: int, iid: int, delta: int, sku: str,
-           before: int, store: str):
+def adjust(shop: str, tok: str, loc: int,
+           iid: int, delta: int, sku: str,
+           before: int, label: str):
     if delta == 0: return
     if DRY_RUN:
-        log(f"[DRY] {store}: SKU {sku} {before:+}→{before+delta}  (Δ {delta:+})")
+        log(f"[DRY] {label}: SKU {sku} {before} → {before+delta}  (Δ {delta:+})")
         return
     shopify(shop, tok, "POST", "/inventory_levels/adjust.json",
             payload={"location_id": loc, "inventory_item_id": iid,
                      "available_adjustment": delta})
-    log(f"{store}: SKU {sku} {before} → {before+delta}  (Δ {delta:+})")
+    log(f"{label}: SKU {sku} {before} → {before+delta}  (Δ {delta:+})")
 
 #######################################################################
-# Order-hämtning
+# Order-hämtning & utskrift
 #######################################################################
 def fetch_orders(shop: str, tok: str, since: datetime) -> List[dict]:
     res, path, params = [], "/orders.json", {
         "status": "any", "limit": 250, "created_at_min": since.isoformat()}
     while True:
         r = shopify(shop, tok, "GET", path, params=params)
-        part = r.json()["orders"]; res += part
+        res += r.json()["orders"]
         nxt = r.headers.get("Link")
         if nxt and 'rel="next"' in nxt:
             path = nxt.split(";")[0].strip("<>").split(API_VERSION)[1]; params = {}
@@ -189,45 +195,58 @@ def sales_in_store2(orders: List[dict],
     sold: Dict[str, int] = {}
     processed: List[int] = []
 
-    log("=== STEG 1: Analyserar Butik 2-ordrar ===")
-    print_orders(orders, "Butik 2")
+    # Filtrera fram ordrar med MINST en ny rad
+    orders_with_new = [
+        o for o in orders
+        if any(not done(SHOP_2, to_int(li["id"])) for li in o.get("line_items", []))
+    ]
+    print_orders(orders_with_new, "Butik 2 – NYA rader")
 
-    for o in orders:
+    for o in orders_with_new:
         if o.get("cancelled_at"): continue
         for li in o.get("line_items", []):
             lid = to_int(li["id"])
-            if lid == 0 or done(SHOP_2, lid): continue
+            if lid == 0:
+                log(f"⤼ Skippar rad utan giltigt ID ({li['id']})", "WARN")
+                continue
+            if done(SHOP_2, lid):
+                log(f"⤼ Skippar rad {lid} (redan behandlad)", "DEBUG")
+                continue
+
             qty = to_int(li.get("quantity"))
-            if qty <= 0: processed.append(lid); continue
+            if qty <= 0:
+                processed.append(lid); continue
             sku = (li.get("sku") or "").strip()
             if sku not in vm2:
-                log(f"Hoppar rad {lid}: okänd SKU {sku}", "WARN")
+                log(f"⤼ Skippar rad {lid}: okänd SKU {sku}", "WARN")
                 processed.append(lid); continue
+
             sold[sku] = sold.get(sku, 0) + qty
             processed.append(lid)
-            log(f"Butik 2 sålt SKU {sku}  QTY {qty}  (tot {sold[sku]})", "INFO")
+            log(f"Butik 2 sålt: rad {lid}  SKU {sku}  QTY {qty}  (tot {sold[sku]})")
 
     mark_done(SHOP_2, processed)
     return sold
 
 #######################################################################
-# MAIN-logik
+# MAIN-flöde
 #######################################################################
 def main():
     init_db()
     since = datetime.utcnow() - timedelta(hours=LOOKBACK_HOURS)
-    log(f"Senast {LOOKBACK_HOURS}h tillbaka = {since.isoformat()}", "DEBUG")
+    log(f"Ser tillbaka {LOOKBACK_HOURS}h ⇒ {since.isoformat()}", "DEBUG")
 
-    # Hämta grunddata
     loc1, loc2 = primary_location(SHOP_1, TOKEN_1), primary_location(SHOP_2, TOKEN_2)
-    vm1, vm2   = variants_by_sku(SHOP_1, TOKEN_1), variants_by_sku(SHOP_2, TOKEN_2)
+    vm1,  vm2  = variants_by_sku(SHOP_1, TOKEN_1), variants_by_sku(SHOP_2, TOKEN_2)
 
-    # Steg 1: sålda kvantiteter i Butik 2
-    sold2 = sales_in_store2(fetch_orders(SHOP_2, TOKEN_2, since), vm2)
-    log(f"Sålt i Butik 2 totalt: {pretty(sold2)}")
+    # --- Steg 1 -------------------------------------------------------
+    log("=== STEG 1: Hämta nya orderrader från Butik 2 ===")
+    orders2 = fetch_orders(SHOP_2, TOKEN_2, since)
+    sold2   = sales_in_store2(orders2, vm2)
+    log(f"Summerad försäljning Butik 2: {pretty(sold2)}")
 
-    # Steg 2: minska lagret i Butik 1
-    log("=== STEG 2: Justerar Butik 1-lager baserat på såld kvantitet ===")
+    # --- Steg 2 -------------------------------------------------------
+    log("=== STEG 2: Minska Butik 1-lager med sålda kvantiteter ===")
     inv1 = inventory(SHOP_1, TOKEN_1, loc1, vm1)
     for sku, qty in sold2.items():
         if sku not in vm1: continue
@@ -236,7 +255,7 @@ def main():
         connect(SHOP_1, TOKEN_1, iid, loc1)
 
         before = inv1.get(sku, 0)
-        delta = -qty
+        delta  = -qty
         if before + delta < 0 and not ALLOW_NEG:
             delta = -before
         adjust(SHOP_1, TOKEN_1, loc1, iid, delta, sku, before, "Butik 1")
@@ -244,8 +263,8 @@ def main():
 
     log(f"Ny lagerstatus Butik 1: {pretty(inv1)}")
 
-    # Steg 3: sätt Butik 2 = Butik 1
-    log("=== STEG 3: Synkar Butik 2-lager till exakt samma som Butik 1 ===")
+    # --- Steg 3 -------------------------------------------------------
+    log("=== STEG 3: Synka Butik 2 → samma saldo som Butik 1 ===")
     inv2 = inventory(SHOP_2, TOKEN_2, loc2, vm2)
     for sku, qty1 in inv1.items():
         if sku not in vm2: continue
@@ -254,18 +273,17 @@ def main():
         iid2, vid2 = vm2[sku]
         ensure_trackable(SHOP_2, TOKEN_2, vid2)
         connect(SHOP_2, TOKEN_2, iid2, loc2)
-        adjust(SHOP_2, TOKEN_2, loc2, iid2, diff, sku,
-               inv2.get(sku, 0), "Butik 2")
+        adjust(SHOP_2, TOKEN_2, loc2, iid2, diff, sku, inv2.get(sku, 0), "Butik 2")
         inv2[sku] = qty1
 
     log(f"Ny lagerstatus Butik 2: {pretty(inv2)}")
-    log("✓ Synk färdig – Butik 2 matchar nu Butik 1")
+    log("✓ Synk klar – Butik 2 matchar nu Butik 1\n")
 
 #######################################################################
 if __name__ == "__main__":
     try:
         mode = "DRY_RUN" if DRY_RUN else "LIVE"
-        log(f"=== Shopify-lager-synk (full verbose) STARTAR  [mode={mode}] ===")
+        log(f"=== Shopify-lager-synk startar  [mode={mode}] ===")
         main()
     except Exception as e:
         log(f"❌ Fel: {e}", "ERR")
