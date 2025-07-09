@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OBC – Lager & Försäljning  (ENDAST Store 1)
+OBC – Lager & Försäljning  (ENDAST Store 1)
 
-• Synkar alltid hela lagersaldot *endast* från angiven “Shop‑location”
-  (USA‑lagret ignoreras).
+• Synkar alltid hela lagersaldot *endast* från angiven “Shop-location”
+  (USA-lagret ignoreras).
 • Vid första körningen kan databasen tömmas helt genom
   miljövariabeln RESET_DATABASE=true; tabeller återskapas sedan automatiskt.
 • Körnings­flöde:
-    1) (ev.) rensa DB‑tabeller
-    2) hämta aktuellt lagersaldo Shopify → Google Sheets
-    3) läs befintlig “Sold:”‑kolumn
-    4) hämta nya ordrar (från 2025‑07‑09 00:00 UTC och framåt)
-    5) uppdatera “Sold:” + försäljningsloggar (Blad 2 & Blad 3)
-    6) beräkna rullande 7‑dagars snitt
-• Skriptet gör **inga** skrivande anrop till Shopify.
+    1) (ev.) rensa DB-tabeller
+    2) hämta aktuellt lagersaldo Shopify → Google Sheets
+    3) läs befintlig “Sold:”-kolumn
+    4) hämta nya ordrar (från 2025-07-09 00:00 UTC och framåt)
+    5) uppdatera “Sold:” + försäljningsloggar (Blad 2 & Blad 3)
+    6) beräkna rullande 7-dagars snitt
+• Skriptet gör **inga** skrivande anrop till Shopify.
 """
 # --------------------------------------------------------------------------- #
 import os, re, time, json, math, requests, gspread, psycopg2
@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from oauth2client.service_account import ServiceAccountCredentials
 from typing import Dict, List
 # --------------------------------------------------------------------------- #
-#                Miljövariabler ‑‑ autentisering & konfiguration             #
+#                Miljövariabler -- autentisering & konfiguration             #
 # --------------------------------------------------------------------------- #
 SHOP_DOMAIN       = os.getenv("SHOP_DOMAIN_1") or "first-shop.myshopify.com"
 SHOPIFY_TOKEN     = os.getenv("SHOPIFY_ACCESS_TOKEN_1") or "access-token-shop-1"
@@ -48,11 +48,11 @@ creds  = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(GOOGLE_CRED
 client = gspread.authorize(creds)
 
 # Google Sheets
-sheet          = client.open("OBC lager").sheet1           # Blad 1
+sheet          = client.open("OBC lager").sheet1           # Blad 1
 sales_sheet    = client.open("OBC lager").worksheet("Blad2")
 sales_sheet_US = client.open("OBC lager").worksheet("Blad3")
 # --------------------------------------------------------------------------- #
-#                              PostgreSQL‑hjälpare                            #
+#                              PostgreSQL-hjälpare                            #
 # --------------------------------------------------------------------------- #
 def pg_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
@@ -94,14 +94,14 @@ def save_processed(ids: List[str]) -> None:
 #                           Övriga hjälpfunktioner                            #
 # --------------------------------------------------------------------------- #
 def safe_api_call(func, *args, **kwargs):
-    """Pausar 2 s mellan anrop och back‑off:ar 60 s vid Google 429."""
+    """Pausar 2 s mellan anrop och back-off:ar 60 s vid Google 429."""
     try:
         res = func(*args, **kwargs)
         time.sleep(2)
         return res
     except gspread.exceptions.APIError as e:
         if e.response.status_code == 429:
-            print("[Google] 429 – väntar 60 s …")
+            print("[Google] 429 – väntar 60 s …")
             time.sleep(60)
             return safe_api_call(func, *args, **kwargs)
         raise
@@ -113,11 +113,11 @@ def extract_perfume_number(text: str):
 def fmt_perfume(num: float) -> str:
     return str(int(num)) if math.isclose(num, round(num)) else str(num)
 # --------------------------------------------------------------------------- #
-#            Shopify → lager (endast angiven location‑id)                    #
+#            Shopify → lager (endast angiven location-id)                    #
 # --------------------------------------------------------------------------- #
 def fetch_shopify_inventory(domain: str, token: str, location_id: str) -> Dict[float, int]:
     """Returnerar {parfymnummer: antal} för *endast* location_id."""
-    # 1. Hämta alla varianter → inventory_item_id ↔ parfymnummer
+    # 1. Hämta alla varianter → inventory_item_id ↔ parfymnummer
     base_v  = f"https://{domain}/admin/api/2023-07/variants.json"
     headers = {"X-Shopify-Access-Token": token}
     params  = {"limit": 250, "fields": "id,title,sku,inventory_item_id"}
@@ -130,7 +130,6 @@ def fetch_shopify_inventory(domain: str, token: str, location_id: str) -> Dict[f
             pnr = extract_perfume_number(v.get("sku") or v.get("title", ""))
             if pnr is not None:
                 item_to_perf[v["inventory_item_id"]] = pnr
-        # pagination
         next_url = None
         for part in r.headers.get("Link", "").split(","):
             if 'rel="next"' in part:
@@ -142,7 +141,7 @@ def fetch_shopify_inventory(domain: str, token: str, location_id: str) -> Dict[f
     if not item_to_perf:
         return {}
 
-    # 2. Hämta inventory‑levels i batchar om 50
+    # 2. Hämta inventory-levels i batchar om 50
     inventory: Dict[float, int] = {}
     items = list(item_to_perf.keys())
     for i in range(0, len(items), 50):
@@ -160,12 +159,15 @@ def fetch_shopify_inventory(domain: str, token: str, location_id: str) -> Dict[f
             p = item_to_perf.get(lv["inventory_item_id"])
             if p is None:
                 continue
-            inventory[p] = inventory.get(p, 0) + lv.get("available", 0)
-    print(f"[Lager‑sync] Hämtade {len(inventory)} parfymnummer från Shopify location {location_id}.")
+            # ----- fix: hantera None -----
+            avail = lv.get("available") or 0   # None → 0
+            # -----------------------------
+            inventory[p] = inventory.get(p, 0) + int(avail)
+    print(f"[Lager-sync] Hämtade {len(inventory)} parfymnummer från Shopify location {location_id}.")
     return inventory
 
 def write_inventory_to_sheet(inv: Dict[float, int]) -> None:
-    """Synkar kolumn B (“Antal:”) mot Shopify."""
+    """Synkar kolumn B (“Antal:”) mot Shopify."""
     vals     = safe_api_call(sheet.get_all_values)
     header   = vals[0] if vals else []
     p_to_row = {}
@@ -180,18 +182,18 @@ def write_inventory_to_sheet(inv: Dict[float, int]) -> None:
     new_rows, updates = [], []
     for pnum, qty in inv.items():
         if pnum in p_to_row:
-            updates.append(gspread.Cell(p_to_row[pnum], 2, qty))   # kolumn B
+            updates.append(gspread.Cell(p_to_row[pnum], 2, qty))   # kolumn B
         else:
             new_rows.append([fmt_perfume(pnum), qty, 0])           # nummer, Antal, Sold
 
     if new_rows:
         safe_api_call(sheet.append_rows, new_rows, value_input_option="USER_ENTERED")
-        print(f"[Lager‑sync] Lagt till {len(new_rows)} nya rader.")
+        print(f"[Lager-sync] Lagt till {len(new_rows)} nya rader.")
     if updates:
         safe_api_call(sheet.update_cells, updates)
-        print(f"[Lager‑sync] Uppdaterat lagersaldo för {len(updates)} rader.")
+        print(f"[Lager-sync] Uppdaterat lagersaldo för {len(updates)} rader.")
 # --------------------------------------------------------------------------- #
-#                           Läser “Sold:” från Blad 1                         #
+#                           Läser “Sold:” från Blad 1                         #
 # --------------------------------------------------------------------------- #
 def read_sold_column() -> Dict[float, int]:
     recs, sold = safe_api_call(sheet.get_all_records), {}
@@ -299,7 +301,7 @@ def log_sales(log: Dict[str, Dict[float, int]], sheet_obj):
     if updates:
         safe_api_call(sheet_obj.update_cells, updates)
 # --------------------------------------------------------------------------- #
-#                         7‑dagars rullande genomsnitt                        #
+#                         7-dagars rullande genomsnitt                        #
 # --------------------------------------------------------------------------- #
 def update_7d_average():
     sales_data = safe_api_call(sales_sheet.get_all_values)
@@ -337,24 +339,24 @@ def update_7d_average():
         for p, total in sums.items() if p in p_to_row
     ]
     if cells:
-        safe_api_call(sheet.update_cell, 1, 4, "Snitt 7d (per dag)")
+        safe_api_call(sheet.update_cell, 1, 4, "Snitt 7d (per dag)")
         safe_api_call(sheet.update_cells, cells)
 # --------------------------------------------------------------------------- #
 #                                    MAIN                                     #
 # --------------------------------------------------------------------------- #
 def main():
-    print("=== OBC Lager‑script (Endast Store 1) ===")
+    print("=== OBC Lager-script (Endast Store 1) ===")
     reset_database()
     init_tables()
 
-    # 1) Hämta och skriv Shopify‑lager (endast Shop‑location)
+    # 1) Hämta och skriv Shopify-lager (endast Shop-location)
     inventory = fetch_shopify_inventory(SHOP_DOMAIN, SHOPIFY_TOKEN, SHOP_LOCATION_ID)
     write_inventory_to_sheet(inventory)
 
-    # 2) Läs befintliga “Sold:”‑värden efter lagersynk
+    # 2) Läs befintliga “Sold:”-värden efter lagersynk
     sold = read_sold_column()
 
-    # 3) Hämta redan processade order‑ID
+    # 3) Hämta redan processade order-ID
     processed = processed_order_ids()
 
     # 4) Hämta nya ordrar
@@ -365,14 +367,14 @@ def main():
     # 5) Processa ordrar (uppdaterar kvarvarande strukturer)
     new_ids, sales_log, sales_log_US = process_orders(orders, sold, processed)
 
-    # 6) Spara nya order‑ID
+    # 6) Spara nya order-ID
     save_processed(new_ids)
 
     # 7) Logga försäljning
     log_sales(sales_log,    sales_sheet)
     log_sales(sales_log_US, sales_sheet_US)
 
-    # 8) Skriv tillbaka “Sold:”‑kolumnen
+    # 8) Skriv tillbaka “Sold:”-kolumnen
     blad1_vals = safe_api_call(sheet.get_all_values)
     p_to_row   = {float(r[0]): i for i, r in enumerate(blad1_vals, 1)
                   if i > 1 and r and r[0].strip()}
@@ -380,10 +382,10 @@ def main():
     if sold_cells:
         safe_api_call(sheet.update_cells, sold_cells)
 
-    # 9) Uppdatera rullande 7‑dagars snitt
+    # 9) Uppdatera rullande 7-dagars snitt
     update_7d_average()
 
-    print("✔ Klart", datetime.utcnow().strftime("%Y‑%m‑%d %H:%M:%S"), "UTC")
+    print("✔ Klart", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), "UTC")
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     main()
